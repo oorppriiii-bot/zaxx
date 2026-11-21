@@ -35,6 +35,16 @@ from aiogram.types import (
 )
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
+# --- ВСЕ КНОПКИ СИНЕГО ЦВЕТА (Telegram Bot API style="primary") ---
+_OrigInlineKeyboardButton = InlineKeyboardButton
+_HAS_BTN_STYLE = "style" in getattr(_OrigInlineKeyboardButton, "model_fields", {})
+
+
+def InlineKeyboardButton(*args, **kwargs):
+    if _HAS_BTN_STYLE:
+        kwargs.setdefault("style", "primary")
+    return _OrigInlineKeyboardButton(*args, **kwargs)
+
 # --- ЗАГРУЗКА ПЕРЕМЕННЫХ ОКРУЖЕНИЯ (.env) ---
 _env_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
 if os.path.exists(_env_path):
@@ -127,6 +137,7 @@ class DashboardInput(StatesGroup):
     waiting_stop_word = State()
     waiting_seller_nick = State()
     waiting_support_msg = State()
+    waiting_topup_amount = State()
     adm_reply_user = State()
     adm_topup_data = State()
     adm_grant_pro_data = State()
@@ -807,13 +818,25 @@ async def activate_pro_for_user(tg_id: int, plan_code: str) -> tuple[str, dateti
     return title, new_pro_until
 
 
-# --- CRYPTOBOT API: СОЗДАНИЕ СЧЁТА И АВТОВЫДАЧА ПОДПИСКИ ---
+# --- CRYPTOBOT API: СОЗДАНИЕ СЧЁТА И АВТОВЫДАЧА ПОДПИСКИ / ПОПОЛНЕНИЯ БАЛАНСА ---
 async def create_cryptobot_invoice(tg_id: int, plan_code: str) -> tuple[str | None, float]:
-    if not CRYPTOBOT_TOKEN or "ВАШ_API_ТОКЕН" in CRYPTOBOT_TOKEN or plan_code not in SUB_PLANS:
+    if not CRYPTOBOT_TOKEN or "ВАШ_API_ТОКЕН" in CRYPTOBOT_TOKEN:
         return None, 0.0
 
-    title, days, price_rub = SUB_PLANS[plan_code]
-    amount_crypto = round(price_rub / USD_TO_RUB, 2)
+    if plan_code.startswith("topup:"):
+        try:
+            price_rub = float(plan_code.split(":", 1)[1])
+        except ValueError:
+            return None, 0.0
+        if price_rub < 10:
+            return None, 0.0
+        title = f"Пополнение баланса на {price_rub:.0f} ₽"
+    elif plan_code in SUB_PLANS:
+        title, days, price_rub = SUB_PLANS[plan_code]
+    else:
+        return None, 0.0
+
+    amount_crypto = round(max(0.05, price_rub / USD_TO_RUB), 2)
 
     headers = {
         "Crypto-Pay-API-Token": CRYPTOBOT_TOKEN,
@@ -905,6 +928,50 @@ async def check_cryptobot_payments_job():
                             (inv_id,)
                         )
                         await db.commit()
+
+                    if str(plan_code).startswith("topup:"):
+                        topup_rub = float(str(plan_code).split(":", 1)[1])
+                        async with aiosqlite.connect(DB_NAME) as db:
+                            await db.execute(
+                                "UPDATE tg_users SET balance = balance + ? WHERE tg_id = ?",
+                                (topup_rub, tg_id)
+                            )
+                            await db.commit()
+
+                        kb = InlineKeyboardMarkup(inline_keyboard=[
+                            [InlineKeyboardButton(text="💎 Перейти к тарифам PRO", callback_data="m:sub")],
+                            [InlineKeyboardButton(text="⚡ Открыть терминал", callback_data="m:main")],
+                        ])
+                        try:
+                            await bot.send_message(
+                                chat_id=tg_id,
+                                text=(
+                                    f"✅ <b>Баланс успешно пополнен через CryptoBot!</b>\n"
+                                    f"<code>──────────────────────────</code>\n"
+                                    f"<blockquote>"
+                                    f"▪ Зачислено на баланс: <b>+{topup_rub:.0f} ₽</b>\n"
+                                    f"▪ Оплачено: <code>{amount_crypto} {asset}</code>"
+                                    f"</blockquote>"
+                                ),
+                                reply_markup=kb,
+                                parse_mode="HTML"
+                            )
+                        except Exception:
+                            pass
+
+                        try:
+                            await bot.send_message(
+                                chat_id=ADMIN_ID,
+                                text=(
+                                    f"🦋 <b>Новое пополнение баланса через CryptoBot!</b>\n"
+                                    f"▪ Пользователь: <code>{tg_id}</code>\n"
+                                    f"▪ Сумма: <b>+{topup_rub:.0f} ₽</b> ({amount_crypto} {asset})"
+                                ),
+                                parse_mode="HTML"
+                            )
+                        except Exception:
+                            pass
+                        continue
 
                     title, new_pro_until = await activate_pro_for_user(tg_id, plan_code)
 
@@ -1089,6 +1156,7 @@ def render_paywall_view(feature_name: str, cfg: dict):
     )
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="💎 Перейти к тарифам PRO", callback_data="m:sub")],
+        [InlineKeyboardButton(text="💳 Пополнение", callback_data="m:topup")],
         [InlineKeyboardButton(text="← Назад в меню", callback_data="m:main")],
     ])
     return text, kb
@@ -1418,6 +1486,8 @@ async def render_main_menu(user: types.User):
         f"<b>Активный фильтр:</b> {' · '.join(mode_parts)} · <code>{cfg['min_price']:.0f}–{cfg['max_price']:.0f} ₽</code>"
     )
 
+    support_url = build_admin_chat_url("Привет! У меня вопрос по FunPay AI Terminal.")
+
     rows = [
         [
             InlineKeyboardButton(text="📊 Аналитика", callback_data="m:an"),
@@ -1433,10 +1503,13 @@ async def render_main_menu(user: types.User):
         ],
         [
             InlineKeyboardButton(text="💎 Подписка PRO", callback_data="m:sub"),
-            InlineKeyboardButton(text="👤 Профиль", callback_data="m:pr"),
+            InlineKeyboardButton(text="💳 Пополнение", callback_data="m:topup"),
         ],
         [
-            InlineKeyboardButton(text="💬 Поддержка", callback_data="in:sup"),
+            InlineKeyboardButton(text="👤 Профиль", callback_data="m:pr"),
+            InlineKeyboardButton(text="💬 Поддержка", url=support_url),
+        ],
+        [
             InlineKeyboardButton(text="↻ Обновить", callback_data="m:main"),
         ],
     ]
@@ -1482,17 +1555,72 @@ async def render_sub_store(user: types.User):
             )
         ])
 
-    topup_stars_url = build_admin_chat_url(
-        f"Привет! Хочу пополнить баланс в FunPay AI Terminal Звездами ⭐️.\nМой ID: {user.id}"
-    )
+    support_url = build_admin_chat_url("Привет! У меня вопрос по FunPay AI Terminal.")
     buttons.append([
-        InlineKeyboardButton(text="⭐️ Пополнить баланс Звездами", url=topup_stars_url)
+        InlineKeyboardButton(text="💳 Пополнение", callback_data="m:topup")
     ])
     buttons.append([
-        InlineKeyboardButton(text="💬 Поддержка", callback_data="in:sup"),
+        InlineKeyboardButton(text="💬 Поддержка", url=support_url),
         InlineKeyboardButton(text="← Меню", callback_data="m:main"),
     ])
     return text, InlineKeyboardMarkup(inline_keyboard=buttons)
+
+
+# 1.1.1 ОБЩИЙ РАЗДЕЛ «ПОПОЛНЕНИЕ» (CRYPTOBOT + ЗВЕЗДЫ)
+async def render_topup_menu(user: types.User):
+    cfg = await get_user_profile(user, inc_req=False)
+    topup_stars_url = build_admin_chat_url(
+        f"Привет! Хочу пополнить баланс / оплатить Звездами ⭐️ в FunPay AI Terminal.\nМой ID: {user.id}"
+    )
+    support_url = build_admin_chat_url("Привет! У меня вопрос по пополнению в FunPay AI Terminal.")
+
+    text = (
+        f"<b>💳 ПОПОЛНЕНИЕ БАЛАНСА</b>\n"
+        f"<code>──────────────────────────</code>\n"
+        f"<blockquote>"
+        f"▪ Ваш текущий баланс: <code>{cfg['balance']:.0f} ₽</code>\n"
+        f"▪ Курс CryptoBot: <code>1 {CRYPTO_ASSET} ≈ {USD_TO_RUB:.0f} ₽</code>\n"
+        f"▪ Курс Telegram Stars: <code>1 ⭐️ ≈ {RUB_PER_STAR:.0f} ₽</code>"
+        f"</blockquote>\n\n"
+        f"<b>Выберите удобный способ пополнения:</b>\n"
+        f"▸ <b>🦋 Оплата CryptoBot</b> — автоматическое создание счёта в <code>{CRYPTO_ASSET}</code> и моментальное зачисление на баланс.\n"
+        f"▸ <b>⭐️ Оплата Звездами</b> — откроется чат с администратором для быстрого пополнения Telegram Stars."
+    )
+
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=f"🦋 Оплата CryptoBot ({CRYPTO_ASSET})", callback_data="m:topup_cb")],
+        [InlineKeyboardButton(text="⭐️ Оплата Звездами", url=topup_stars_url)],
+        [
+            InlineKeyboardButton(text="💎 Тарифы PRO", callback_data="m:sub"),
+            InlineKeyboardButton(text="💬 Поддержка", url=support_url),
+        ],
+        [InlineKeyboardButton(text="← Главное меню", callback_data="m:main")],
+    ])
+    return text, kb
+
+
+async def render_topup_cryptobot_menu(user: types.User):
+    cfg = await get_user_profile(user, inc_req=False)
+    text = (
+        f"<b>🦋 ПОПОЛНЕНИЕ ЧЕРЕЗ CRYPTOBOT</b>\n"
+        f"<code>──────────────────────────</code>\n"
+        f"<blockquote>"
+        f"▪ Текущий баланс: <code>{cfg['balance']:.0f} ₽</code>\n"
+        f"▪ Валюта оплаты: <b>{CRYPTO_ASSET}</b>"
+        f"</blockquote>\n\n"
+        f"Выберите сумму пополнения (или введите свою сумму):"
+    )
+    amounts = [99, 299, 500, 790, 1000, 2000]
+    amt_buttons = []
+    for rub in amounts:
+        usdt = round(rub / USD_TO_RUB, 2)
+        amt_buttons.append(
+            InlineKeyboardButton(text=f"+{rub} ₽ (~{usdt} {CRYPTO_ASSET})", callback_data=f"cb:topup:{rub}")
+        )
+    rows = chunk_buttons(amt_buttons, 2)
+    rows.append([InlineKeyboardButton(text="✏️ Ввести свою сумму", callback_data="in:topup")])
+    rows.append([InlineKeyboardButton(text="← Назад в Пополнение", callback_data="m:topup")])
+    return text, InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 # 1.1.2 ШАГ 2: СТРАНИЦА ОФОРМЛЕНИЯ ВЫБРАННОГО ТАРИФА
@@ -2375,15 +2503,14 @@ async def render_profile_menu(user: types.User):
     if len(tags) < 6:
         buttons.append([InlineKeyboardButton(text="+ Добавить пресет", callback_data="in:tag")])
 
-    topup_stars_url = build_admin_chat_url(
-        f"Привет! Хочу пополнить баланс в FunPay AI Terminal Звездами ⭐️.\nМой ID: {user.id}"
-    )
+    support_url = build_admin_chat_url("Привет! У меня вопрос по FunPay AI Terminal.")
     buttons.append([
-        InlineKeyboardButton(text="⭐️ Пополнить баланс Звездами", url=topup_stars_url)
+        InlineKeyboardButton(text="💳 Пополнение", callback_data="m:topup"),
+        InlineKeyboardButton(text="💎 Подписка PRO", callback_data="m:sub"),
     ])
     buttons.append([
         InlineKeyboardButton(text="🤝 Реферальная система", callback_data="m:ref"),
-        InlineKeyboardButton(text="💎 Подписка PRO", callback_data="m:sub"),
+        InlineKeyboardButton(text="💬 Поддержка", url=support_url),
     ])
     buttons.append([
         InlineKeyboardButton(text="🔒 Конфиденциальность", callback_data="m:priv"),
@@ -2551,6 +2678,57 @@ async def cb_sub_store(callback: types.CallbackQuery, state: FSMContext):
     text, kb = await render_sub_store(callback.from_user)
     await switch_screen(callback.message, text, kb)
     await callback.answer()
+
+
+@dp.callback_query(F.data == "m:topup")
+async def cb_topup_menu(callback: types.CallbackQuery, state: FSMContext):
+    await state.clear()
+    text, kb = await render_topup_menu(callback.from_user)
+    await switch_screen(callback.message, text, kb)
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "m:topup_cb")
+async def cb_topup_cb_menu(callback: types.CallbackQuery, state: FSMContext):
+    await state.clear()
+    text, kb = await render_topup_cryptobot_menu(callback.from_user)
+    await switch_screen(callback.message, text, kb)
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("cb:topup:"))
+async def cb_cryptobot_topup(callback: types.CallbackQuery):
+    try:
+        price_rub = float(callback.data.split(":")[2])
+    except Exception:
+        await callback.answer("Некорректная сумма")
+        return
+
+    if not CRYPTOBOT_TOKEN or "ВАШ_API_ТОКЕН" in CRYPTOBOT_TOKEN:
+        await callback.answer("Токен CryptoBot не настроен в файле bot.py / .env", show_alert=True)
+        return
+
+    await callback.answer("Создаю счёт в CryptoBot...")
+    pay_url, amount_crypto = await create_cryptobot_invoice(callback.from_user.id, f"topup:{price_rub:.0f}")
+    if not pay_url:
+        await callback.answer("Ошибка создания счёта. Проверьте токен CryptoBot.", show_alert=True)
+        return
+
+    text = (
+        f"🦋 <b>Пополнение баланса через CryptoBot</b>\n"
+        f"<code>──────────────────────────</code>\n"
+        f"<blockquote>"
+        f"▪ Зачисление на баланс: <b>+{price_rub:.0f} ₽</b>\n"
+        f"▪ К оплате: <code>{amount_crypto} {CRYPTO_ASSET}</code>\n"
+        f"▪ Время на оплату: <b>30 минут</b>"
+        f"</blockquote>\n\n"
+        f"Нажмите кнопку ниже — откроется счёт в <b>@CryptoBot</b>. После оплаты средства зачислятся на ваш баланс автоматически в течение 10 секунд."
+    )
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=f"🦋 Перейти к оплате ({amount_crypto} {CRYPTO_ASSET})", url=pay_url)],
+        [InlineKeyboardButton(text="← Назад к выбору суммы", callback_data="m:topup_cb")],
+    ])
+    await switch_screen(callback.message, text, kb)
 
 
 @dp.callback_query(F.data.startswith("sub:plan:"))
@@ -3105,6 +3283,7 @@ async def cb_start_input(callback: types.CallbackQuery, state: FSMContext):
         "srch": (DashboardInput.waiting_search_query, "🔎 Введите <b>слово для поиска</b> по всему каталогу (например: <code>veo</code>):", "m:main"),
         "ex": (DashboardInput.waiting_stop_word, "🚫 Введите новое <b>стоп-слово</b> для исключения (например: <code>общий</code>):", "m:ex"),
         "spy": (DashboardInput.waiting_seller_nick, "🕵️ Введите точный <b>никнейм продавца</b> на FunPay:", "m:sp"),
+        "topup": (DashboardInput.waiting_topup_amount, "💳 Введите <b>сумму пополнения баланса</b> в рублях (от <code>50</code> ₽):", "m:topup_cb"),
         "sup": (DashboardInput.waiting_support_msg, "💬 <b>Обращение в поддержку</b>\n\nНапишите ваш вопрос одним сообщением — оно сразу уйдёт администратору:", "m:main"),
         "adm_bal": (DashboardInput.adm_topup_data, "💰 Отправьте <b>Telegram_ID и сумму</b> через пробел.\nПример: <code>123456789 1000</code>:", "m:adm"),
         "adm_pro": (DashboardInput.adm_grant_pro_data, "💎 Отправьте <b>Telegram_ID и количество дней PRO</b> через пробел.\nПример: <code>123456789 30</code> (<code>0</code> — снять PRO):", "m:adm"),
@@ -3293,6 +3472,52 @@ async def process_adm_grant_pro(message: types.Message, state: FSMContext):
         await db.commit()
 
     await finalize_fsm_screen(message, state, render_admin_panel())
+
+
+@dp.message(DashboardInput.waiting_topup_amount)
+async def process_topup_amount(message: types.Message, state: FSMContext):
+    try:
+        price_rub = float((message.text or "").replace(",", ".").strip())
+        if price_rub < 50:
+            raise ValueError
+    except Exception:
+        await message.delete()
+        return
+
+    data = await state.get_data()
+    dash_msg_id = data.get("dash_msg_id")
+    await state.clear()
+    try:
+        await message.delete()
+    except Exception:
+        pass
+    if dash_msg_id:
+        try:
+            await bot.delete_message(chat_id=message.chat.id, message_id=dash_msg_id)
+        except Exception:
+            pass
+
+    pay_url, amount_crypto = await create_cryptobot_invoice(message.from_user.id, f"topup:{price_rub:.0f}")
+    if not pay_url:
+        text, kb = await render_topup_cryptobot_menu(message.from_user)
+        await message.answer(text, reply_markup=kb, parse_mode="HTML")
+        return
+
+    text = (
+        f"🦋 <b>Пополнение баланса через CryptoBot</b>\n"
+        f"<code>──────────────────────────</code>\n"
+        f"<blockquote>"
+        f"▪ Зачисление на баланс: <b>+{price_rub:.0f} ₽</b>\n"
+        f"▪ К оплате: <code>{amount_crypto} {CRYPTO_ASSET}</code>\n"
+        f"▪ Время на оплату: <b>30 минут</b>"
+        f"</blockquote>\n\n"
+        f"Нажмите кнопку ниже — откроется счёт в <b>@CryptoBot</b>. После оплаты средства зачислятся на ваш баланс автоматически в течение 10 секунд."
+    )
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=f"🦋 Перейти к оплате ({amount_crypto} {CRYPTO_ASSET})", url=pay_url)],
+        [InlineKeyboardButton(text="← Назад к выбору суммы", callback_data="m:topup_cb")],
+    ])
+    await message.answer(text, reply_markup=kb, parse_mode="HTML")
 
 
 @dp.message(DashboardInput.waiting_min_price)
