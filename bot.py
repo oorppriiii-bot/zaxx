@@ -1486,8 +1486,6 @@ async def render_main_menu(user: types.User):
         f"<b>Активный фильтр:</b> {' · '.join(mode_parts)} · <code>{cfg['min_price']:.0f}–{cfg['max_price']:.0f} ₽</code>"
     )
 
-    support_url = build_admin_chat_url("Привет! У меня вопрос по FunPay AI Terminal.")
-
     rows = [
         [
             InlineKeyboardButton(text="📊 Аналитика", callback_data="m:an"),
@@ -1503,11 +1501,7 @@ async def render_main_menu(user: types.User):
         ],
         [
             InlineKeyboardButton(text="💎 Подписка PRO", callback_data="m:sub"),
-            InlineKeyboardButton(text="💳 Пополнение", callback_data="m:topup"),
-        ],
-        [
             InlineKeyboardButton(text="👤 Профиль", callback_data="m:pr"),
-            InlineKeyboardButton(text="💬 Поддержка", url=support_url),
         ],
         [
             InlineKeyboardButton(text="↻ Обновить", callback_data="m:main"),
@@ -2489,9 +2483,10 @@ async def render_profile_menu(user: types.User):
         f"▪ ID: <code>{user.id}</code> · {role}\n"
         f"▪ Баланс: <code>{cfg['balance']:.0f} ₽</code> · {sub_str}\n"
         f"▪ В системе с <code>{joined_dt.strftime('%d.%m.%Y')}</code> ({days_in_bot} дн.) · Запросов: <b>{cfg['requests_count']}</b>"
-        f"</blockquote>\n\n"
-        f"<b>Сохранённые пресеты поиска ({len(tags)}/6):</b>"
+        f"</blockquote>"
     )
+    if tags:
+        text += f"\n\n<b>Сохранённые пресеты поиска ({len(tags)}/6):</b>"
 
     buttons = []
     for idx, tag in enumerate(tags[:6]):
@@ -2500,17 +2495,14 @@ async def render_profile_menu(user: types.User):
             InlineKeyboardButton(text="✕", callback_data=f"ps:del:{idx}"),
         ])
 
-    if len(tags) < 6:
-        buttons.append([InlineKeyboardButton(text="+ Добавить пресет", callback_data="in:tag")])
-
     support_url = build_admin_chat_url("Привет! У меня вопрос по FunPay AI Terminal.")
     buttons.append([
         InlineKeyboardButton(text="💳 Пополнение", callback_data="m:topup"),
-        InlineKeyboardButton(text="💎 Подписка PRO", callback_data="m:sub"),
+        InlineKeyboardButton(text="💬 Поддержка", url=support_url),
     ])
     buttons.append([
+        InlineKeyboardButton(text="💎 Подписка PRO", callback_data="m:sub"),
         InlineKeyboardButton(text="🤝 Реферальная система", callback_data="m:ref"),
-        InlineKeyboardButton(text="💬 Поддержка", url=support_url),
     ])
     buttons.append([
         InlineKeyboardButton(text="🔒 Конфиденциальность", callback_data="m:priv"),
